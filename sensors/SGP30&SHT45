@@ -1,0 +1,21 @@
+import board
+import time
+import adafruit_sht4x
+import adafruit_sgp30
+
+i2c = board.STEMMA_I2C()
+
+sht = adafruit_sht4x.SHT4x(i2c)
+sgp = adafruit_sgp30.Adafruit_SGP30(i2c)
+sgp.iaq_init()
+
+print("Sensors connected!")
+
+while True:
+    temp, humidity = sht.measurements
+    print("Temp: " + str(round(temp, 1)) + "C")
+    print("Humidity: " + str(round(humidity)) + "%")
+    print("eCO2: " + str(sgp.eCO2) + " ppm")
+    print("TVOC: " + str(sgp.TVOC) + " ppb")
+    print("---")
+    time.sleep(3)
