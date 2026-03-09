@@ -1,77 +1,106 @@
-# fan_control.py — CircuitPython for Adafruit Feather RP2040
-# Controls two 24V fans via MOSFETs based on temperature sensor reading
+# filtration_fans.py — CircuitPython for Adafruit Feather RP2040
+# Two 24V filtration fans controlled proportionally by SGP30 VOC readings
+# Includes tachometer fault detection for both fans
 
 import board
 import busio
-import digitalio
 import pwmio
-import analogio
+import countio
 import time
+import adafruit_sgp30
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-TEMP_THRESHOLD_ON  = 30.0   # °C — fans turn ON above this
-TEMP_THRESHOLD_OFF = 27.0   # °C — fans turn OFF below this (hysteresis)
-PWM_FREQ           = 25000  # Hz  — 25 kHz is standard for PC-style fans
-FAN_FULL_SPEED     = 65535  # Max PWM duty cycle (16-bit)
-CHECK_INTERVAL     = 2.0    # seconds between temperature readings
+# VOC (eCO2 used as proxy; SGP30 reports TVOC in ppb)
+TVOC_MIN        = 0      # ppb — fans run at minimum speed
+TVOC_MAX        = 500    # ppb — fans run at full speed (clamps above this)
 
-# ── Pin assignments ─────────────────────────────────────────────────────────
-# Fan PWM control pins — connect to MOSFET gate (logic-level MOSFET like IRL540N)
-# The MOSFET switches the 24V GND path; 24V+ goes directly to fan +
-FAN1_PIN = board.D5   # PWM-capable pin
-FAN2_PIN = board.D6   # PWM-capable pin
+FAN_MIN_DUTY    = 16384  # ~25% — minimum to keep fans spinning (don't go below this)
+FAN_MAX_DUTY    = 65535  # 100% full speed
+PWM_FREQ        = 25000  # 25 kHz standard PWM for fans
 
-# Optional: fan tachometer (RPM feedback) pins
-# FAN1_TACH = board.D9
-# FAN2_TACH = board.D10
+# Tachometer — most fans pulse twice per revolution
+TACH_PULSES_PER_REV = 2
+TACH_SAMPLE_TIME    = 2.0   # seconds to count pulses for RPM calc
+MIN_RPM             = 200   # below this = fan fault
 
-# Temperature sensor — using onboard or external analog sensor (e.g. TMP36)
-TEMP_SENSOR_PIN = board.A0   # Analog input for TMP36 / NTC thermistor
+# How often to read VOC and update fan speed (seconds)
+UPDATE_INTERVAL = 3.0
 
-# ── Setup ───────────────────────────────────────────────────────────────────
-fan1 = pwmio.PWMOut(FAN1_PIN, frequency=PWM_FREQ, duty_cycle=0)
-fan2 = pwmio.PWMOut(FAN2_PIN, frequency=PWM_FREQ, duty_cycle=0)
-temp_sensor = analogio.AnalogIn(TEMP_SENSOR_PIN)
+# ── Pin assignments ────────────────────────────────────────────────────────────
+# PWM output → MOSFET gate → switches 24V GND path for each fan
+FAN1_PWM_PIN  = board.D5
+FAN2_PWM_PIN  = board.D6
 
-# ── Temperature reading (TMP36 sensor) ──────────────────────────────────────
-def read_temperature_c():
-    """Read temperature from TMP36 analog sensor."""
-    # TMP36: Vout = 0.5V + (10mV × Temp°C)  →  Temp = (Vout - 0.5) / 0.01
-    voltage = (temp_sensor.value / 65535) * 3.3   # convert ADC → volts (3.3V ref)
-    temperature = (voltage - 0.5) / 0.01
-    return temperature
+# Tachometer inputs (open-collector, needs pull-up — use 10kΩ to 3.3V)
+FAN1_TACH_PIN = board.D9
+FAN2_TACH_PIN = board.D10
 
-# ── Fan control ──────────────────────────────────────────────────────────────
-def set_fans(speed):
-    """Set both fans to a duty cycle. 0 = off, 65535 = full speed."""
-    fan1.duty_cycle = speed
-    fan2.duty_cycle = speed
+# I2C for SGP30 (Feather RP2040: SDA=D24/A4, SCL=D25/A5 or use board.SDA/SCL)
+I2C_SDA = board.SDA
+I2C_SCL = board.SCL
 
-def fans_on():
-    set_fans(FAN_FULL_SPEED)
-    print("  → Fans ON (full speed)")
+# ── Setup ──────────────────────────────────────────────────────────────────────
+i2c  = busio.I2C(I2C_SCL, I2C_SDA)
+sgp  = adafruit_sgp30.Adafruit_SGP30(i2c)
+sgp.iaq_init()
+sgp.set_iaq_baseline(0x8973, 0x8AAE)  # optional: set a saved baseline if you have one
 
-def fans_off():
-    set_fans(0)
-    print("  → Fans OFF")
+fan1 = pwmio.PWMOut(FAN1_PWM_PIN, frequency=PWM_FREQ, duty_cycle=FAN_MIN_DUTY)
+fan2 = pwmio.PWMOut(FAN2_PWM_PIN, frequency=PWM_FREQ, duty_cycle=FAN_MIN_DUTY)
 
-# ── Main loop ────────────────────────────────────────────────────────────────
-print("Fan controller starting...")
-print(f"  Threshold ON : {TEMP_THRESHOLD_ON}°C")
-print(f"  Threshold OFF: {TEMP_THRESHOLD_OFF}°C")
+tach1 = countio.Counter(FAN1_TACH_PIN, edge=countio.Edge.RISE)
+tach2 = countio.Counter(FAN2_TACH_PIN, edge=countio.Edge.RISE)
 
-fans_running = False
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def tvoc_to_duty(tvoc):
+    """Map TVOC ppb → PWM duty cycle between FAN_MIN and FAN_MAX."""
+    ratio = (tvoc - TVOC_MIN) / (TVOC_MAX - TVOC_MIN)
+    ratio = max(0.0, min(1.0, ratio))           # clamp 0.0–1.0
+    return int(FAN_MIN_DUTY + ratio * (FAN_MAX_DUTY - FAN_MIN_DUTY))
 
+def set_fans(duty):
+    fan1.duty_cycle = duty
+    fan2.duty_cycle = duty
+
+def measure_rpm(counter, sample_seconds):
+    """Count tach pulses over sample_seconds and return RPM."""
+    counter.reset()
+    time.sleep(sample_seconds)
+    pulses = counter.count
+    rpm = (pulses / TACH_PULSES_PER_REV) * (60.0 / sample_seconds)
+    return rpm
+
+def check_faults(duty):
+    """Sample both tachometers and warn if RPM is too low."""
+    rpm1 = measure_rpm(tach1, TACH_SAMPLE_TIME)
+    rpm2 = measure_rpm(tach2, TACH_SAMPLE_TIME)
+    print(f"  Fan 1: {rpm1:.0f} RPM  |  Fan 2: {rpm2:.0f} RPM")
+    if duty > FAN_MIN_DUTY:   # only flag faults when fans should be spinning
+        if rpm1 < MIN_RPM:
+            print("  ⚠️  FAULT: Fan 1 RPM too low — check wiring or fan!")
+        if rpm2 < MIN_RPM:
+            print("  ⚠️  FAULT: Fan 2 RPM too low — check wiring or fan!")
+
+# ── SGP30 warm-up ──────────────────────────────────────────────────────────────
+# SGP30 needs ~15s of readings before TVOC values are reliable
+print("SGP30 warming up (15s)...")
+set_fans(FAN_MIN_DUTY)   # run at minimum during warm-up
+for _ in range(15):
+    _ = sgp.tvoc             # keep internal algorithm running
+    time.sleep(1)
+print("Warm-up complete. Starting filtration control.\n")
+
+# ── Main loop ──────────────────────────────────────────────────────────────────
 while True:
-    temp = read_temperature_c()
-    print(f"Temperature: {temp:.1f}°C  |  Fans: {'ON' if fans_running else 'OFF'}")
+    tvoc = sgp.tvoc                   # TVOC in ppb
+    eco2 = sgp.eCO2                   # eCO2 in ppm (bonus reading)
+    duty = tvoc_to_duty(tvoc)
+    speed_pct = (duty / FAN_MAX_DUTY) * 100
 
-    if not fans_running and temp >= TEMP_THRESHOLD_ON:
-        fans_on()
-        fans_running = True
+    set_fans(duty)
 
-    elif fans_running and temp <= TEMP_THRESHOLD_OFF:
-        fans_off()
-        fans_running = False
+    print(f"TVOC: {tvoc} ppb  |  eCO2: {eco2} ppm  |  Fan speed: {speed_pct:.1f}%")
+    check_faults(duty)
+    print()
 
-    time.sleep(CHECK_INTERVAL)
+    time.sleep(UPDATE_INTERVAL)
