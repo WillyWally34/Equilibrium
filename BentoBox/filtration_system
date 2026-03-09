@@ -1,0 +1,77 @@
+# fan_control.py — CircuitPython for Adafruit Feather RP2040
+# Controls two 24V fans via MOSFETs based on temperature sensor reading
+
+import board
+import busio
+import digitalio
+import pwmio
+import analogio
+import time
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+TEMP_THRESHOLD_ON  = 30.0   # °C — fans turn ON above this
+TEMP_THRESHOLD_OFF = 27.0   # °C — fans turn OFF below this (hysteresis)
+PWM_FREQ           = 25000  # Hz  — 25 kHz is standard for PC-style fans
+FAN_FULL_SPEED     = 65535  # Max PWM duty cycle (16-bit)
+CHECK_INTERVAL     = 2.0    # seconds between temperature readings
+
+# ── Pin assignments ─────────────────────────────────────────────────────────
+# Fan PWM control pins — connect to MOSFET gate (logic-level MOSFET like IRL540N)
+# The MOSFET switches the 24V GND path; 24V+ goes directly to fan +
+FAN1_PIN = board.D5   # PWM-capable pin
+FAN2_PIN = board.D6   # PWM-capable pin
+
+# Optional: fan tachometer (RPM feedback) pins
+# FAN1_TACH = board.D9
+# FAN2_TACH = board.D10
+
+# Temperature sensor — using onboard or external analog sensor (e.g. TMP36)
+TEMP_SENSOR_PIN = board.A0   # Analog input for TMP36 / NTC thermistor
+
+# ── Setup ───────────────────────────────────────────────────────────────────
+fan1 = pwmio.PWMOut(FAN1_PIN, frequency=PWM_FREQ, duty_cycle=0)
+fan2 = pwmio.PWMOut(FAN2_PIN, frequency=PWM_FREQ, duty_cycle=0)
+temp_sensor = analogio.AnalogIn(TEMP_SENSOR_PIN)
+
+# ── Temperature reading (TMP36 sensor) ──────────────────────────────────────
+def read_temperature_c():
+    """Read temperature from TMP36 analog sensor."""
+    # TMP36: Vout = 0.5V + (10mV × Temp°C)  →  Temp = (Vout - 0.5) / 0.01
+    voltage = (temp_sensor.value / 65535) * 3.3   # convert ADC → volts (3.3V ref)
+    temperature = (voltage - 0.5) / 0.01
+    return temperature
+
+# ── Fan control ──────────────────────────────────────────────────────────────
+def set_fans(speed):
+    """Set both fans to a duty cycle. 0 = off, 65535 = full speed."""
+    fan1.duty_cycle = speed
+    fan2.duty_cycle = speed
+
+def fans_on():
+    set_fans(FAN_FULL_SPEED)
+    print("  → Fans ON (full speed)")
+
+def fans_off():
+    set_fans(0)
+    print("  → Fans OFF")
+
+# ── Main loop ────────────────────────────────────────────────────────────────
+print("Fan controller starting...")
+print(f"  Threshold ON : {TEMP_THRESHOLD_ON}°C")
+print(f"  Threshold OFF: {TEMP_THRESHOLD_OFF}°C")
+
+fans_running = False
+
+while True:
+    temp = read_temperature_c()
+    print(f"Temperature: {temp:.1f}°C  |  Fans: {'ON' if fans_running else 'OFF'}")
+
+    if not fans_running and temp >= TEMP_THRESHOLD_ON:
+        fans_on()
+        fans_running = True
+
+    elif fans_running and temp <= TEMP_THRESHOLD_OFF:
+        fans_off()
+        fans_running = False
+
+    time.sleep(CHECK_INTERVAL)
